@@ -1,0 +1,278 @@
+// ============================================================================
+// SHA-1 implementation for MySQL authentication (mysql_native_password)
+// Uses i64 to represent unsigned 32-bit values (0 to 4294967295)
+// Bitwise XOR/OR/NOT implemented via arithmetic (Novus only has & for AND)
+// ============================================================================
+
+module mysql_sha1;
+
+import ../../lib/std;
+
+// -- 32-bit mask constant --
+
+fn sha_mask() -> i64 {
+    return str_to_i64("4294967295");
+}
+
+// -- Type conversion helpers --
+
+fn sha_to_i64(x: i32) -> i64 {
+    return u64_to_i64(i32_to_u64(x));
+}
+
+fn sha_to_i32(x: i64) -> i32 {
+    return u64_to_i32(i64_to_u64(x));
+}
+
+// -- Bitwise operations on 32-bit values stored in i64 --
+
+fn sha_xor(a: i64, b: i64) -> i64 {
+    let x: i64 = a & sha_mask();
+    let y: i64 = b & sha_mask();
+    let xy: i64 = x & y;
+    return (x + y - xy - xy) & sha_mask();
+}
+
+fn sha_or(a: i64, b: i64) -> i64 {
+    let x: i64 = a & sha_mask();
+    let y: i64 = b & sha_mask();
+    return (x + y - (x & y)) & sha_mask();
+}
+
+fn sha_not(a: i64) -> i64 {
+    return sha_xor(a, sha_mask());
+}
+
+// -- Shift operations --
+
+fn sha_shl(a: i64, n: i32) -> i64 {
+    let r: i64 = a & sha_mask();
+    let i: i32 = 0;
+    while (i < n) {
+        r = r * 2;
+        i = i + 1;
+    }
+    return r & sha_mask();
+}
+
+fn sha_shr(a: i64, n: i32) -> i64 {
+    let r: i64 = a & sha_mask();
+    let i: i32 = 0;
+    while (i < n) {
+        r = r / 2;
+        i = i + 1;
+    }
+    return r;
+}
+
+fn sha_rotl(a: i64, n: i32) -> i64 {
+    return sha_or(sha_shl(a, n), sha_shr(a, 32 - n));
+}
+
+fn sha_add(a: i64, b: i64) -> i64 {
+    return (a + b) & sha_mask();
+}
+
+// -- Word buffer: store 32-bit values in string buffer (big-endian) --
+
+fn sha_w_put(buf: str, idx: i32, val: i64) -> void {
+    let off: i32 = idx * 4;
+    let addr: u64 = ptr(buf);
+    let v: i64 = val & sha_mask();
+    let m: i64 = str_to_i64("255");
+    store8(addr + i32_to_u64(off),     sha_to_i32(sha_shr(v, 24)));
+    store8(addr + i32_to_u64(off + 1), sha_to_i32(sha_shr(v, 16) & m));
+    store8(addr + i32_to_u64(off + 2), sha_to_i32(sha_shr(v, 8) & m));
+    store8(addr + i32_to_u64(off + 3), sha_to_i32(v & m));
+}
+
+fn sha_w_get(buf: str, idx: i32) -> i64 {
+    let off: i32 = idx * 4;
+    let b0: i64 = sha_to_i64(byte_at(buf, off));
+    let b1: i64 = sha_to_i64(byte_at(buf, off + 1));
+    let b2: i64 = sha_to_i64(byte_at(buf, off + 2));
+    let b3: i64 = sha_to_i64(byte_at(buf, off + 3));
+    return sha_or(sha_or(sha_shl(b0, 24), sha_shl(b1, 16)),
+                  sha_or(sha_shl(b2, 8), b3));
+}
+
+// -- SHA-1 block processing --
+
+fn sha1_process_block(state: str, block: str) -> void {
+    let w: str = make_buffer(320);
+
+    let i: i32 = 0;
+    while (i < 16) {
+        sha_w_put(w, i, sha_w_get(block, i));
+        i = i + 1;
+    }
+
+    i = 16;
+    while (i < 80) {
+        let t: i64 = sha_xor(sha_xor(sha_w_get(w, i - 3), sha_w_get(w, i - 8)),
+                              sha_xor(sha_w_get(w, i - 14), sha_w_get(w, i - 16)));
+        sha_w_put(w, i, sha_rotl(t, 1));
+        i = i + 1;
+    }
+
+    let a: i64 = sha_w_get(state, 0);
+    let b: i64 = sha_w_get(state, 1);
+    let c: i64 = sha_w_get(state, 2);
+    let d: i64 = sha_w_get(state, 3);
+    let e: i64 = sha_w_get(state, 4);
+
+    let k0: i64 = str_to_i64("1518500249");
+    let k1: i64 = str_to_i64("1859775393");
+    let k2: i64 = str_to_i64("2400959708");
+    let k3: i64 = str_to_i64("3395469782");
+
+    i = 0;
+    while (i < 80) {
+        let f: i64 = 0;
+        let k: i64 = 0;
+        if (i < 20) {
+            f = sha_or(b & c, sha_not(b) & d);
+            k = k0;
+        } else if (i < 40) {
+            f = sha_xor(sha_xor(b, c), d);
+            k = k1;
+        } else if (i < 60) {
+            f = sha_or(sha_or(b & c, b & d), c & d);
+            k = k2;
+        } else {
+            f = sha_xor(sha_xor(b, c), d);
+            k = k3;
+        }
+
+        let temp: i64 = sha_add(sha_add(sha_add(sha_add(
+            sha_rotl(a, 5), f), e), k), sha_w_get(w, i));
+        e = d;
+        d = c;
+        c = sha_rotl(b, 30);
+        b = a;
+        a = temp;
+
+        i = i + 1;
+    }
+
+    sha_w_put(state, 0, sha_add(sha_w_get(state, 0), a));
+    sha_w_put(state, 1, sha_add(sha_w_get(state, 1), b));
+    sha_w_put(state, 2, sha_add(sha_w_get(state, 2), c));
+    sha_w_put(state, 3, sha_add(sha_w_get(state, 3), d));
+    sha_w_put(state, 4, sha_add(sha_w_get(state, 4), e));
+}
+
+// -- Main SHA-1 hash function --
+
+fn sha1_hash(data: str, data_len: i32) -> str {
+    let state: str = make_buffer(20);
+    sha_w_put(state, 0, str_to_i64("1732584193"));
+    sha_w_put(state, 1, str_to_i64("4023233417"));
+    sha_w_put(state, 2, str_to_i64("2562383102"));
+    sha_w_put(state, 3, str_to_i64("271733878"));
+    sha_w_put(state, 4, str_to_i64("3285377520"));
+
+    let padded_blocks: i32 = (data_len + 9 + 63) / 64;
+    let padded_len: i32 = padded_blocks * 64;
+
+    let padded: str = make_buffer(padded_len);
+    let paddr: u64 = ptr(padded);
+
+    let i: i32 = 0;
+    while (i < data_len) {
+        store8(paddr + i32_to_u64(i), byte_at(data, i));
+        i = i + 1;
+    }
+
+    store8(paddr + i32_to_u64(data_len), 128);
+
+    i = data_len + 1;
+    while (i < padded_len - 8) {
+        store8(paddr + i32_to_u64(i), 0);
+        i = i + 1;
+    }
+
+    let bit_len: i64 = sha_to_i64(data_len) * 8;
+    let m: i64 = str_to_i64("255");
+    store8(paddr + i32_to_u64(padded_len - 8), 0);
+    store8(paddr + i32_to_u64(padded_len - 7), 0);
+    store8(paddr + i32_to_u64(padded_len - 6), 0);
+    store8(paddr + i32_to_u64(padded_len - 5), 0);
+    store8(paddr + i32_to_u64(padded_len - 4), sha_to_i32(sha_shr(bit_len, 24) & m));
+    store8(paddr + i32_to_u64(padded_len - 3), sha_to_i32(sha_shr(bit_len, 16) & m));
+    store8(paddr + i32_to_u64(padded_len - 2), sha_to_i32(sha_shr(bit_len, 8) & m));
+    store8(paddr + i32_to_u64(padded_len - 1), sha_to_i32(bit_len & m));
+
+    i = 0;
+    while (i < padded_len) {
+        let block: str = make_buffer(64);
+        let baddr: u64 = ptr(block);
+        let j: i32 = 0;
+        while (j < 64) {
+            store8(baddr + i32_to_u64(j), byte_at(padded, i + j));
+            j = j + 1;
+        }
+        sha1_process_block(state, block);
+        i = i + 64;
+    }
+
+    return state;
+}
+
+// -- Utility functions --
+
+fn sha1_xor_bytes(a: str, b: str, length: i32) -> str {
+    let result: str = make_buffer(length);
+    let raddr: u64 = ptr(result);
+    let i: i32 = 0;
+    while (i < length) {
+        let av: i32 = byte_at(a, i);
+        let bv: i32 = byte_at(b, i);
+        let xv: i32 = av + bv - 2 * (av & bv);
+        store8(raddr + i32_to_u64(i), xv);
+        i = i + 1;
+    }
+    return result;
+}
+
+fn sha1_concat(a: str, a_len: i32, b: str, b_len: i32) -> str {
+    let total: i32 = a_len + b_len;
+    let result: str = make_buffer(total);
+    let raddr: u64 = ptr(result);
+    let i: i32 = 0;
+    while (i < a_len) {
+        store8(raddr + i32_to_u64(i), byte_at(a, i));
+        i = i + 1;
+    }
+    i = 0;
+    while (i < b_len) {
+        store8(raddr + i32_to_u64(a_len + i), byte_at(b, i));
+        i = i + 1;
+    }
+    return result;
+}
+
+// mysql_native_password authentication
+fn sha1_mysql_auth(scramble: str, password: str) -> str {
+    let pass_len: i32 = len(password);
+    let stage1: str = sha1_hash(password, pass_len);
+    let stage2: str = sha1_hash(stage1, 20);
+    let combined: str = sha1_concat(scramble, 20, stage2, 20);
+    let stage3: str = sha1_hash(combined, 40);
+    return sha1_xor_bytes(stage1, stage3, 20);
+}
+
+// Convert 20-byte hash to 40-char hex string
+fn sha1_to_hex(hash: str) -> str {
+    let hex_chars: str = "0123456789abcdef";
+    let result: str = "";
+    let i: i32 = 0;
+    while (i < 20) {
+        let b: i32 = byte_at(hash, i);
+        let hi: i32 = b / 16;
+        let lo: i32 = b - hi * 16;
+        result = result + hex_chars[hi] + hex_chars[lo];
+        i = i + 1;
+    }
+    return result;
+}

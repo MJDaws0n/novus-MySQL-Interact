@@ -1,0 +1,9 @@
+// ---------------------------------------------------------------------------
+// MySQL-Interact - MySQL client library for Novus
+// Platform loader
+// MySQL is a trademark of Oracle Corporation. This project is not affiliated with Oracle.
+// ---------------------------------------------------------------------------
+
+module mysql_interact_main;
+
+import mysql;

@@ -1,0 +1,118 @@
+// MySQL-Interact test file for macOS ARM64
+// Tests SHA-1 bitwise operations (arithmetic-based assembly alternatives)
+// and SQL escaping/safety functions.
+
+module mysql_interact_tests;
+import main;
+
+fn test_pass(name: str) -> void {
+    print_raw("  [PASS] " + name + "\n");
+}
+
+fn test_fail(name: str, detail: str) -> void {
+    print_raw("  [FAIL] " + name + ": " + detail + "\n");
+}
+
+fn main(argc: i32, argv: u64) -> i32 {
+    let pass: i32 = 0;
+    let fail: i32 = 0;
+
+    print_raw("=== MySQL-Interact tests (windows_amd64) ===\n");
+
+    // --- SHA-1 Bitwise Operations (custom arithmetic implementations) ---
+    print_raw("\n--- SHA-1 Bitwise Ops ---\n");
+
+    // XOR: 255 ^ 170 = 85
+    let xr: i64 = sha_xor(str_to_i64("255"), str_to_i64("170"));
+    if (xr == str_to_i64("85")) { test_pass("sha_xor"); pass = pass + 1; } else { test_fail("sha_xor", "got " + i64_to_str(xr)); fail = fail + 1; }
+
+    // OR: 240 | 15 = 255
+    let orr: i64 = sha_or(str_to_i64("240"), str_to_i64("15"));
+    if (orr == str_to_i64("255")) { test_pass("sha_or"); pass = pass + 1; } else { test_fail("sha_or", "got " + i64_to_str(orr)); fail = fail + 1; }
+
+    // NOT: ~0 = 4294967295
+    let nr: i64 = sha_not(str_to_i64("0"));
+    if (nr == str_to_i64("4294967295")) { test_pass("sha_not(0)"); pass = pass + 1; } else { test_fail("sha_not(0)", "got " + i64_to_str(nr)); fail = fail + 1; }
+
+    // NOT: ~4294967295 = 0
+    let nr2: i64 = sha_not(str_to_i64("4294967295"));
+    if (nr2 == str_to_i64("0")) { test_pass("sha_not(max)"); pass = pass + 1; } else { test_fail("sha_not(max)", "got " + i64_to_str(nr2)); fail = fail + 1; }
+
+    // SHL: 1 << 8 = 256
+    let sl: i64 = sha_shl(str_to_i64("1"), 8);
+    if (sl == str_to_i64("256")) { test_pass("sha_shl"); pass = pass + 1; } else { test_fail("sha_shl", "got " + i64_to_str(sl)); fail = fail + 1; }
+
+    // SHR: 256 >> 8 = 1
+    let sr: i64 = sha_shr(str_to_i64("256"), 8);
+    if (sr == str_to_i64("1")) { test_pass("sha_shr"); pass = pass + 1; } else { test_fail("sha_shr", "got " + i64_to_str(sr)); fail = fail + 1; }
+
+    // ROTL: rotl(1, 1) = 2
+    let rl: i64 = sha_rotl(str_to_i64("1"), 1);
+    if (rl == str_to_i64("2")) { test_pass("sha_rotl(1,1)"); pass = pass + 1; } else { test_fail("sha_rotl(1,1)", "got " + i64_to_str(rl)); fail = fail + 1; }
+
+    // ROTL: rotl(1, 31) = 2147483648 (0x80000000)
+    let rl2: i64 = sha_rotl(str_to_i64("1"), 31);
+    if (rl2 == str_to_i64("2147483648")) { test_pass("sha_rotl(1,31)"); pass = pass + 1; } else { test_fail("sha_rotl(1,31)", "got " + i64_to_str(rl2)); fail = fail + 1; }
+
+    // ADD modular: add(max, 1) = 0
+    let ar: i64 = sha_add(str_to_i64("4294967295"), str_to_i64("1"));
+    if (ar == str_to_i64("0")) { test_pass("sha_add wrap"); pass = pass + 1; } else { test_fail("sha_add wrap", "got " + i64_to_str(ar)); fail = fail + 1; }
+
+    // --- SHA-1 Hash Vectors ---
+    print_raw("\n--- SHA-1 Hash Vectors ---\n");
+
+    let h1: str = sha1_to_hex(sha1_hash("abc", 3));
+    if (h1 == "a9993e364706816aba3e25717850c26c9cd0d89d") { test_pass("sha1(abc)"); pass = pass + 1; } else { test_fail("sha1(abc)", h1); fail = fail + 1; }
+
+    let h2: str = sha1_to_hex(sha1_hash("", 0));
+    if (h2 == "da39a3ee5e6b4b0d3255bfef95601890afd80709") { test_pass("sha1(empty)"); pass = pass + 1; } else { test_fail("sha1(empty)", h2); fail = fail + 1; }
+
+    let h3: str = sha1_to_hex(sha1_hash("password", 8));
+    if (h3 == "5baa61e4c9b93f3f0682250b6cf8331b7ee68fd8") { test_pass("sha1(password)"); pass = pass + 1; } else { test_fail("sha1(password)", h3); fail = fail + 1; }
+
+    let h4: str = sha1_to_hex(sha1_hash("The quick brown fox jumps over the lazy dog", 43));
+    if (h4 == "2fd4e1c67a2d28fced849ee1bb76e7391b93eb12") { test_pass("sha1(fox)"); pass = pass + 1; } else { test_fail("sha1(fox)", h4); fail = fail + 1; }
+
+    // --- SQL Escaping ---
+    print_raw("\n--- SQL Escaping ---\n");
+
+    let e1: str = mysql_escape("it's");
+    if (e1 == "it\\'s") { test_pass("escape single quote"); pass = pass + 1; } else { test_fail("escape single quote", e1); fail = fail + 1; }
+
+    let e2: str = mysql_escape("path\\dir");
+    if (e2 == "path\\\\dir") { test_pass("escape backslash"); pass = pass + 1; } else { test_fail("escape backslash", e2); fail = fail + 1; }
+
+    let e3: str = mysql_quote("hello");
+    if (e3 == "'hello'") { test_pass("quote()"); pass = pass + 1; } else { test_fail("quote()", e3); fail = fail + 1; }
+
+    let e4: str = mysql_escape_id("table");
+    if (e4 == "`table`") { test_pass("escape_id()"); pass = pass + 1; } else { test_fail("escape_id()", e4); fail = fail + 1; }
+
+    // --- Parameterized Queries ---
+    print_raw("\n--- Parameterized Queries ---\n");
+
+    let pq1: str = mysql_set_param_str("SELECT * FROM t WHERE name = ?", "Alice");
+    if (starts_with(pq1, "SELECT * FROM t WHERE name = 'Alice'")) { test_pass("param_str"); pass = pass + 1; } else { test_fail("param_str", pq1); fail = fail + 1; }
+
+    let pq2: str = mysql_set_param_i32("SELECT * FROM t WHERE id = ?", 42);
+    if (starts_with(pq2, "SELECT * FROM t WHERE id = 42")) { test_pass("param_i32"); pass = pass + 1; } else { test_fail("param_i32", pq2); fail = fail + 1; }
+
+    let pq3: str = mysql_set_param_null("INSERT INTO t (v) VALUES (?)");
+    if (starts_with(pq3, "INSERT INTO t (v) VALUES (NULL)")) { test_pass("param_null"); pass = pass + 1; } else { test_fail("param_null", pq3); fail = fail + 1; }
+
+    // SQL injection prevention via escaping
+    let evil: str = mysql_set_param_str("SELECT * FROM t WHERE name = ?", "'; DROP TABLE t; --");
+    if (str_find(evil, "DROP") < 0 || str_find(evil, "\\'") >= 0) { test_pass("injection escaped"); pass = pass + 1; } else { test_fail("injection escaped", evil); fail = fail + 1; }
+
+    // --- Result Type Checks ---
+    print_raw("\n--- Result Type Checks ---\n");
+
+    if (mysql_is_error("ERR")) { test_pass("is_error(ERR)"); pass = pass + 1; } else { test_fail("is_error(ERR)", "false"); fail = fail + 1; }
+    if (!mysql_is_error("OK")) { test_pass("!is_error(OK)"); pass = pass + 1; } else { test_fail("!is_error(OK)", "true"); fail = fail + 1; }
+    if (mysql_is_result_set("RS")) { test_pass("is_result_set(RS)"); pass = pass + 1; } else { test_fail("is_result_set(RS)", "false"); fail = fail + 1; }
+    if (!mysql_is_result_set("ERR")) { test_pass("!is_result_set(ERR)"); pass = pass + 1; } else { test_fail("!is_result_set(ERR)", "true"); fail = fail + 1; }
+    if (mysql_is_ok("OK")) { test_pass("is_ok(OK)"); pass = pass + 1; } else { test_fail("is_ok(OK)", "false"); fail = fail + 1; }
+
+    print_raw("\n=== Results: " + i32_to_str(pass) + " passed, " + i32_to_str(fail) + " failed ===\n");
+    return fail;
+}

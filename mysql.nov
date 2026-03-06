@@ -1,0 +1,1334 @@
+// ============================================================================
+// MySQL-Interact - MySQL client library for Novus
+// Implements the MySQL wire protocol over TCP sockets.
+// Supports text queries, prepared statements, transactions, and
+// mysql_native_password authentication (SHA-1).
+//
+// MySQL is a trademark of Oracle Corporation.
+// This project is not affiliated with Oracle.
+// ============================================================================
+
+module mysql_interact;
+
+import sha1;
+import ../../lib/std;
+import ../../lib/net;
+
+// ============================================================================
+// Internal: byte-level helpers
+// ============================================================================
+
+fn my_to_i64(x: i32) -> i64 {
+    return u64_to_i64(i32_to_u64(x));
+}
+
+fn my_to_i32(x: i64) -> i32 {
+    return u64_to_i32(i64_to_u64(x));
+}
+
+fn my_buf_copy(dst: str, dst_off: i32, src: str, src_off: i32, count: i32) -> void {
+    let da: u64 = ptr(dst);
+    let i: i32 = 0;
+    while (i < count) {
+        store8(da + i32_to_u64(dst_off + i), byte_at(src, src_off + i));
+        i = i + 1;
+    }
+}
+
+fn my_buf_set(dst: str, off: i32, val: i32) -> void {
+    store8(ptr(dst) + i32_to_u64(off), val);
+}
+
+fn my_buf_get(src: str, off: i32) -> i32 {
+    return byte_at(src, off);
+}
+
+// Read a little-endian u16 from buffer
+fn my_read_u16(buf: str, off: i32) -> i32 {
+    return my_buf_get(buf, off) + my_buf_get(buf, off + 1) * 256;
+}
+
+// Read a little-endian u32 from buffer (returns i64 to avoid overflow)
+fn my_read_u32(buf: str, off: i32) -> i64 {
+    let b0: i64 = my_to_i64(my_buf_get(buf, off));
+    let b1: i64 = my_to_i64(my_buf_get(buf, off + 1));
+    let b2: i64 = my_to_i64(my_buf_get(buf, off + 2));
+    let b3: i64 = my_to_i64(my_buf_get(buf, off + 3));
+    return b0 + b1 * 256 + b2 * 65536 + b3 * 16777216;
+}
+
+// Write a little-endian u16 to buffer
+fn my_write_u16(buf: str, off: i32, val: i32) -> void {
+    my_buf_set(buf, off, val & 255);
+    my_buf_set(buf, off + 1, (val / 256) & 255);
+}
+
+// Write a little-endian u24 to buffer
+fn my_write_u24(buf: str, off: i32, val: i32) -> void {
+    my_buf_set(buf, off, val & 255);
+    my_buf_set(buf, off + 1, (val / 256) & 255);
+    my_buf_set(buf, off + 2, (val / 65536) & 255);
+}
+
+// Write a little-endian u32 to buffer
+fn my_write_u32(buf: str, off: i32, val: i64) -> void {
+    let m: i64 = str_to_i64("255");
+    my_buf_set(buf, off, my_to_i32(val & m));
+    my_buf_set(buf, off + 1, my_to_i32((val / 256) & m));
+    my_buf_set(buf, off + 2, my_to_i32((val / 65536) & m));
+    my_buf_set(buf, off + 3, my_to_i32((val / 16777216) & m));
+}
+
+// Write a null-terminated string to buffer, return bytes written (including null)
+fn my_write_cstr(buf: str, off: i32, s: str) -> i32 {
+    let slen: i32 = len(s);
+    let addr: u64 = ptr(buf);
+    let i: i32 = 0;
+    while (i < slen) {
+        store8(addr + i32_to_u64(off + i), byte_at(s, i));
+        i = i + 1;
+    }
+    store8(addr + i32_to_u64(off + slen), 0);
+    return slen + 1;
+}
+
+// Read null-terminated string from buffer
+fn my_read_cstr(buf: str, off: i32) -> str {
+    let result: str = "";
+    let i: i32 = off;
+    while (my_buf_get(buf, i) != 0) {
+        let ch: i32 = my_buf_get(buf, i);
+        let tmp: str = "x";
+        store8(ptr(tmp), ch);
+        result = result + tmp;
+        i = i + 1;
+    }
+    return result;
+}
+
+// Length of null-terminated string in buffer
+fn my_cstr_len(buf: str, off: i32) -> i32 {
+    let i: i32 = off;
+    while (my_buf_get(buf, i) != 0) {
+        i = i + 1;
+    }
+    return i - off;
+}
+
+// Read a length-encoded integer (MySQL protocol)
+// Returns the value and advances offset. Since we can't return two values,
+// we encode offset in upper bits: result = value, new_offset must be computed separately
+fn my_read_lenenc_val(buf: str, off: i32) -> i64 {
+    let first: i32 = my_buf_get(buf, off);
+    if (first < 251) {
+        return my_to_i64(first);
+    } else if (first == 252) {
+        return my_to_i64(my_read_u16(buf, off + 1));
+    } else if (first == 253) {
+        let b0: i64 = my_to_i64(my_buf_get(buf, off + 1));
+        let b1: i64 = my_to_i64(my_buf_get(buf, off + 2));
+        let b2: i64 = my_to_i64(my_buf_get(buf, off + 3));
+        return b0 + b1 * 256 + b2 * 65536;
+    } else if (first == 254) {
+        return my_read_u32(buf, off + 1);
+    }
+    return 0;
+}
+
+// Size of length-encoded integer at given offset
+fn my_lenenc_size(buf: str, off: i32) -> i32 {
+    let first: i32 = my_buf_get(buf, off);
+    if (first < 251) { return 1; }
+    if (first == 252) { return 3; }
+    if (first == 253) { return 4; }
+    if (first == 254) { return 9; }
+    return 1;
+}
+
+// ============================================================================
+// Packet I/O
+// ============================================================================
+
+// Read exactly `length` bytes from socket into a buffer
+fn my_read_exact(fd: i32, length: i32) -> str {
+    let result: str = make_buffer(length);
+    let dest: u64 = ptr(result);
+    let total: i32 = 0;
+    let tmp: str = make_buffer(4096);
+    while (total < length) {
+        let want: i32 = length - total;
+        if (want > 4096) { want = 4096; }
+        let got: i32 = net_read(fd, tmp, want);
+        if (got <= 0) { break; }
+        let i: i32 = 0;
+        while (i < got) {
+            store8(dest + i32_to_u64(total + i), byte_at(tmp, i));
+            i = i + 1;
+        }
+        total = total + got;
+    }
+    return result;
+}
+
+// Read a MySQL packet. Returns length-prefixed buffer:
+// Bytes 0-3: payload length encoded with +1 offset (avoids null bytes breaking len())
+// Bytes 4+: payload data
+// Returns empty string on error.
+fn mysql_read_packet(fd: i32) -> str {
+    let header: str = my_read_exact(fd, 4);
+    let payload_len: i32 = my_buf_get(header, 0) +
+                           my_buf_get(header, 1) * 256 +
+                           my_buf_get(header, 2) * 65536;
+    if (payload_len <= 0) { return ""; }
+    let result: str = make_buffer(4 + payload_len);
+    // Encode length with +1 per byte to avoid null terminators
+    my_buf_set(result, 0, (payload_len & 255) + 1);
+    my_buf_set(result, 1, ((payload_len / 256) & 255) + 1);
+    my_buf_set(result, 2, ((payload_len / 65536) & 255) + 1);
+    my_buf_set(result, 3, 1);
+    // Read payload into result at offset 4
+    let dest: u64 = ptr(result);
+    let total: i32 = 0;
+    let tmp: str = make_buffer(4096);
+    while (total < payload_len) {
+        let want: i32 = payload_len - total;
+        if (want > 4096) { want = 4096; }
+        let got: i32 = net_read(fd, tmp, want);
+        if (got <= 0) { break; }
+        let i: i32 = 0;
+        while (i < got) {
+            store8(dest + i32_to_u64(4 + total + i), byte_at(tmp, i));
+            i = i + 1;
+        }
+        total = total + got;
+    }
+    return result;
+}
+
+// Get payload length from a length-prefixed packet
+fn my_pkt_len(pkt: str) -> i32 {
+    if (len(pkt) < 4) { return 0; }
+    let b0: i32 = my_buf_get(pkt, 0) - 1;
+    let b1: i32 = my_buf_get(pkt, 1) - 1;
+    let b2: i32 = my_buf_get(pkt, 2) - 1;
+    return b0 + b1 * 256 + b2 * 65536;
+}
+
+// Read a byte from the payload (auto-offsets past the 4-byte length prefix)
+fn my_pkt_byte(pkt: str, off: i32) -> i32 {
+    return my_buf_get(pkt, off + 4);
+}
+
+// Write a MySQL packet with given sequence number
+fn mysql_write_packet(fd: i32, seq: i32, data: str, data_len: i32) -> void {
+    let pkt: str = make_buffer(4 + data_len);
+    my_write_u24(pkt, 0, data_len);
+    my_buf_set(pkt, 3, seq & 255);
+    my_buf_copy(pkt, 4, data, 0, data_len);
+    net_write(fd, pkt, 4 + data_len);
+}
+
+// ============================================================================
+// Handshake and Authentication
+// ============================================================================
+
+// Connect to MySQL and authenticate. Returns fd on success, -1 on failure.
+fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
+                 user: str, password: str, database: str) -> i32 {
+    net_ignore_sigpipe();
+    let fd: i32 = net_socket();
+    if (fd < 0) { return -1; }
+    let rc: i32 = net_connect(fd, a, b, c, d, port);
+    if (rc < 0) {
+        net_close(fd);
+        return -1;
+    }
+
+    // Read server greeting
+    let greeting: str = mysql_read_packet(fd);
+    if (my_pkt_len(greeting) < 1) {
+        net_close(fd);
+        return -1;
+    }
+
+    let proto_ver: i32 = my_pkt_byte(greeting, 0);
+    if (proto_ver != 10) {
+        net_close(fd);
+        return -1;
+    }
+
+    // Parse server version (null-terminated string at offset 1)
+    let sv_len: i32 = my_cstr_len(greeting, 5);
+    let off: i32 = 1 + sv_len + 1;
+
+    // Connection ID (4 bytes)
+    off = off + 4;
+
+    // Auth plugin data part 1 (8 bytes)
+    let scramble: str = make_buffer(20);
+    my_buf_copy(scramble, 0, greeting, off + 4, 8);
+    off = off + 8;
+
+    // Filler (1 byte)
+    off = off + 1;
+
+    // Capability flags lower 2 bytes
+    let cap_lo: i32 = my_read_u16(greeting, off + 4);
+    off = off + 2;
+
+    // Character set (1 byte)
+    off = off + 1;
+
+    // Status flags (2 bytes)
+    off = off + 2;
+
+    // Capability flags upper 2 bytes
+    let cap_hi: i32 = my_read_u16(greeting, off + 4);
+    off = off + 2;
+
+    // Auth plugin data length or 0 (1 byte)
+    let auth_data_len: i32 = my_pkt_byte(greeting, off);
+    off = off + 1;
+
+    // Reserved 10 bytes
+    off = off + 10;
+
+    // Auth plugin data part 2 (at least 13 bytes for mysql_native_password)
+    let part2_len: i32 = auth_data_len - 8;
+    if (part2_len < 0) { part2_len = 13; }
+    if (part2_len > 13) { part2_len = 13; }
+    my_buf_copy(scramble, 8, greeting, off + 4, 12);
+
+    // Build client authentication packet
+    let usr_len: i32 = len(user);
+    let db_len: i32 = len(database);
+    let auth_plugin: str = "mysql_native_password";
+    let auth_plugin_len: i32 = len(auth_plugin);
+
+    // Capability flags:
+    // CLIENT_PROTOCOL_41 (0x0200) | CLIENT_SECURE_CONNECTION (0x8000)
+    // CLIENT_CONNECT_WITH_DB (0x0008) if database is specified
+    // CLIENT_PLUGIN_AUTH (0x00080000)
+    let cap_flags: i64 = str_to_i64("524288");
+    cap_flags = cap_flags + str_to_i64("512");
+    cap_flags = cap_flags + str_to_i64("32768");
+    if (db_len > 0) {
+        cap_flags = cap_flags + 8;
+    }
+
+    // Compute auth response
+    let auth_resp: str = make_buffer(20);
+    let auth_resp_len: i32 = 0;
+    if (len(password) > 0) {
+        auth_resp = sha1_mysql_auth(scramble, password);
+        auth_resp_len = 20;
+    }
+
+    // Build packet: 4 cap + 4 max_pkt + 1 charset + 23 reserved + user\0 + auth_len + auth + db\0 + plugin\0
+    let pkt_len: i32 = 4 + 4 + 1 + 23 + usr_len + 1 + 1 + auth_resp_len;
+    if (db_len > 0) {
+        pkt_len = pkt_len + db_len + 1;
+    }
+    pkt_len = pkt_len + auth_plugin_len + 1;
+
+    let pkt: str = make_buffer(pkt_len);
+    let poff: i32 = 0;
+
+    // Client capability flags (4 bytes LE)
+    my_write_u32(pkt, poff, cap_flags);
+    poff = poff + 4;
+
+    // Max packet size (4 bytes LE) - 16MB
+    my_write_u32(pkt, poff, str_to_i64("16777216"));
+    poff = poff + 4;
+
+    // Character set: utf8mb4 (45 = 0x2D)
+    my_buf_set(pkt, poff, 45);
+    poff = poff + 1;
+
+    // Reserved (23 zero bytes)
+    let ri: i32 = 0;
+    while (ri < 23) {
+        my_buf_set(pkt, poff + ri, 0);
+        ri = ri + 1;
+    }
+    poff = poff + 23;
+
+    // Username (null-terminated)
+    poff = poff + my_write_cstr(pkt, poff, user);
+
+    // Auth response length + data
+    my_buf_set(pkt, poff, auth_resp_len);
+    poff = poff + 1;
+    if (auth_resp_len > 0) {
+        my_buf_copy(pkt, poff, auth_resp, 0, auth_resp_len);
+        poff = poff + auth_resp_len;
+    }
+
+    // Database (null-terminated, if specified)
+    if (db_len > 0) {
+        poff = poff + my_write_cstr(pkt, poff, database);
+    }
+
+    // Auth plugin name (null-terminated)
+    poff = poff + my_write_cstr(pkt, poff, auth_plugin);
+
+    // Send auth packet (sequence = 1)
+    mysql_write_packet(fd, 1, pkt, poff);
+
+    // Read auth result
+    let resp: str = mysql_read_packet(fd);
+    let resp_len: i32 = my_pkt_len(resp);
+    if (resp_len < 1) {
+        net_close(fd);
+        return -1;
+    }
+
+    let resp_type: i32 = my_pkt_byte(resp, 0);
+    if (resp_type == 0) {
+        return fd;
+    } else if (resp_type == 254) {
+        // Auth switch request: parse plugin name and new scramble
+        let switch_plugin_len: i32 = my_cstr_len(resp, 5);
+        let switch_off: i32 = 5 + switch_plugin_len + 1;
+        // Check if requested plugin is mysql_native_password
+        let is_native: i32 = 1;
+        let np_str: str = "mysql_native_password";
+        if (switch_plugin_len != 21) { is_native = 0; }
+        if (is_native == 1) {
+            let ci: i32 = 0;
+            while (ci < 21) {
+                if (my_buf_get(resp, 5 + ci) != byte_at(np_str, ci)) {
+                    is_native = 0;
+                    ci = 21;
+                }
+                ci = ci + 1;
+            }
+        }
+        if (is_native == 0) {
+            net_close(fd);
+            return -1;
+        }
+        // Read new 20-byte scramble from switch packet
+        let new_scramble: str = make_buffer(20);
+        my_buf_copy(new_scramble, 0, resp, switch_off, 20);
+        // Compute auth with new scramble
+        let new_auth: str = sha1_mysql_auth(new_scramble, password);
+        // Send auth response (sequence = 3)
+        mysql_write_packet(fd, 3, new_auth, 20);
+        // Read result
+        let resp2: str = mysql_read_packet(fd);
+        if (my_pkt_len(resp2) < 1) {
+            net_close(fd);
+            return -1;
+        }
+        if (my_pkt_byte(resp2, 0) == 0) {
+            return fd;
+        }
+        net_close(fd);
+        return -1;
+    } else {
+        // Error packet
+        net_close(fd);
+        return -1;
+    }
+}
+
+// Connect to localhost
+fn mysql_connect_local(port: i32, user: str, password: str, database: str) -> i32 {
+    return mysql_connect(127, 0, 0, 1, port, user, password, database);
+}
+
+// Close connection
+fn mysql_close(fd: i32) -> void {
+    // Send COM_QUIT
+    let quit: str = make_buffer(1);
+    my_buf_set(quit, 0, 1);
+    mysql_write_packet(fd, 0, quit, 1);
+    net_close(fd);
+}
+
+// Ping the server
+fn mysql_ping(fd: i32) -> bool {
+    let ping: str = make_buffer(1);
+    my_buf_set(ping, 0, 14);
+    mysql_write_packet(fd, 0, ping, 1);
+    let resp: str = mysql_read_packet(fd);
+    if (my_pkt_len(resp) < 1) { return false; }
+    return my_pkt_byte(resp, 0) == 0;
+}
+
+// ============================================================================
+// Result format (internal encoding)
+// Fields separated by \x01 (SOH), rows by \x02 (STX), NULL as \x03 (ETX)
+// Prefix: "OK\x01...", "RS\x01...", "ERR\x01..."
+// ============================================================================
+
+fn my_sep() -> str {
+    let s: str = make_buffer(1);
+    store8(ptr(s), 1);
+    return s;
+}
+
+fn my_row_sep() -> str {
+    let s: str = make_buffer(1);
+    store8(ptr(s), 2);
+    return s;
+}
+
+fn my_null_marker() -> str {
+    let s: str = make_buffer(1);
+    store8(ptr(s), 3);
+    return s;
+}
+
+// Parse an OK packet into result string
+fn my_parse_ok(pkt: str) -> str {
+    let off: i32 = 5;
+    let affected: i64 = my_read_lenenc_val(pkt, off);
+    off = off + my_lenenc_size(pkt, off);
+    let insert_id: i64 = my_read_lenenc_val(pkt, off);
+    let r: str = "OK";
+    r = r + my_sep();
+    r = r + i64_to_str(affected);
+    r = r + my_sep();
+    r = r + i64_to_str(insert_id);
+    return r;
+}
+
+// Parse an ERR packet into result string
+fn my_parse_err(pkt: str) -> str {
+    let errcode: i32 = my_read_u16(pkt, 5);
+    let msg_off: i32 = 7;
+    if (my_buf_get(pkt, 7) == 35) {
+        msg_off = 13;
+    }
+    let msg: str = "";
+    let pkt_len: i32 = my_pkt_len(pkt) + 4;
+    let i: i32 = msg_off;
+    while (i < pkt_len) {
+        let ch: i32 = my_buf_get(pkt, i);
+        if (ch == 0) { break; }
+        let tmp: str = "x";
+        store8(ptr(tmp), ch);
+        msg = msg + tmp;
+        i = i + 1;
+    }
+    let r: str = "ERR";
+    r = r + my_sep();
+    r = r + i32_to_str(errcode);
+    r = r + my_sep();
+    r = r + msg;
+    return r;
+}
+
+// ============================================================================
+// Text Protocol Queries (COM_QUERY)
+// ============================================================================
+
+fn mysql_query(fd: i32, sql: str) -> str {
+    let sql_len: i32 = len(sql);
+    let pkt: str = make_buffer(1 + sql_len);
+    my_buf_set(pkt, 0, 3);
+    my_buf_copy(pkt, 1, sql, 0, sql_len);
+    mysql_write_packet(fd, 0, pkt, 1 + sql_len);
+
+    // Read response
+    let resp: str = mysql_read_packet(fd);
+    if (my_pkt_len(resp) < 1) { return "ERR" + my_sep() + "0" + my_sep() + "empty response"; }
+
+    let first: i32 = my_pkt_byte(resp, 0);
+
+    // OK packet
+    if (first == 0) {
+        return my_parse_ok(resp);
+    }
+
+    // ERR packet
+    if (first == 255) {
+        return my_parse_err(resp);
+    }
+
+    // Result set: first byte is column count (length-encoded)
+    let num_cols: i32 = my_to_i32(my_read_lenenc_val(resp, 4));
+
+    // Read column definitions
+    let result: str = "RS" + my_sep() + i32_to_str(num_cols);
+    let ci: i32 = 0;
+    while (ci < num_cols) {
+        let col_pkt: str = mysql_read_packet(fd);
+        // Column def has: catalog, schema, table, org_table, name, org_name, ...
+        // Skip catalog, schema, table, org_table (4 length-encoded strings)
+        let coff: i32 = 4;
+        let skip: i32 = 0;
+        while (skip < 4) {
+            let slen: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
+            coff = coff + my_lenenc_size(col_pkt, coff) + slen;
+            skip = skip + 1;
+        }
+        // Read column name (length-encoded string)
+        let name_len: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
+        coff = coff + my_lenenc_size(col_pkt, coff);
+        let col_name: str = "";
+        let ni: i32 = 0;
+        while (ni < name_len) {
+            let ch: i32 = my_buf_get(col_pkt, coff + ni);
+            let tmp: str = "x";
+            store8(ptr(tmp), ch);
+            col_name = col_name + tmp;
+            ni = ni + 1;
+        }
+        result = result + my_sep() + col_name;
+        ci = ci + 1;
+    }
+
+    // Read EOF packet after column definitions
+    let eof1: str = mysql_read_packet(fd);
+
+    // Read row data
+    let row_sep: str = my_row_sep();
+    let null_m: str = my_null_marker();
+    let reading_rows: bool = true;
+    while (reading_rows) {
+        let row_pkt: str = mysql_read_packet(fd);
+        if (my_pkt_len(row_pkt) < 1) { break; }
+        let row_first: i32 = my_pkt_byte(row_pkt, 0);
+
+        // EOF packet (0xFE) with length < 9 signals end of rows
+        if (row_first == 254 && my_pkt_len(row_pkt) < 9) {
+            reading_rows = false;
+        } else if (row_first == 255) {
+            // Error during result
+            reading_rows = false;
+        } else {
+            // Parse row: each column is a length-encoded string or NULL (0xFB)
+            result = result + row_sep;
+            let roff: i32 = 4;
+            let col_idx: i32 = 0;
+            while (col_idx < num_cols) {
+                if (col_idx > 0) { result = result + my_sep(); }
+                let fb: i32 = my_buf_get(row_pkt, roff);
+                if (fb == 251) {
+                    result = result + null_m;
+                    roff = roff + 1;
+                } else {
+                    let val_len: i32 = my_to_i32(my_read_lenenc_val(row_pkt, roff));
+                    roff = roff + my_lenenc_size(row_pkt, roff);
+                    let val: str = "";
+                    let vi: i32 = 0;
+                    while (vi < val_len) {
+                        let ch: i32 = my_buf_get(row_pkt, roff + vi);
+                        let tmp: str = "x";
+                        store8(ptr(tmp), ch);
+                        val = val + tmp;
+                        vi = vi + 1;
+                    }
+                    result = result + val;
+                    roff = roff + val_len;
+                }
+                col_idx = col_idx + 1;
+            }
+        }
+    }
+
+    return result;
+}
+
+// ============================================================================
+// Result accessors
+// ============================================================================
+
+// Check if result is an error
+fn mysql_is_error(result: str) -> bool {
+    return starts_with(result, "ERR");
+}
+
+// Check if result is OK (non-SELECT success)
+fn mysql_is_ok(result: str) -> bool {
+    return starts_with(result, "OK");
+}
+
+// Check if result is a result set (SELECT)
+fn mysql_is_result_set(result: str) -> bool {
+    return starts_with(result, "RS");
+}
+
+// Get error message
+fn mysql_error_msg(result: str) -> str {
+    if (!mysql_is_error(result)) { return ""; }
+    let rest: str = substr(result, 4);
+    let sep_pos: i32 = str_find(rest, my_sep());
+    if (sep_pos < 0) { return rest; }
+    return substr(rest, sep_pos + 1);
+}
+
+// Get error code
+fn mysql_error_code(result: str) -> i32 {
+    if (!mysql_is_error(result)) { return 0; }
+    let rest: str = substr(result, 4);
+    let sep_pos: i32 = str_find(rest, my_sep());
+    if (sep_pos < 0) { return 0; }
+    return str_to_i32(substr_len(rest, 0, sep_pos));
+}
+
+// Get affected rows count (for OK results)
+fn mysql_affected_rows(result: str) -> i64 {
+    if (!mysql_is_ok(result)) { return 0; }
+    let rest: str = substr(result, 3);
+    let sep_pos: i32 = str_find(rest, my_sep());
+    if (sep_pos < 0) { return 0; }
+    return str_to_i64(substr_len(rest, 0, sep_pos));
+}
+
+// Get last insert ID (for OK results)
+fn mysql_insert_id(result: str) -> i64 {
+    if (!mysql_is_ok(result)) { return 0; }
+    let rest: str = substr(result, 3);
+    let sep1: i32 = str_find(rest, my_sep());
+    if (sep1 < 0) { return 0; }
+    let rest2: str = substr(rest, sep1 + 1);
+    let sep2: i32 = str_find(rest2, my_sep());
+    if (sep2 < 0) { return str_to_i64(rest2); }
+    return str_to_i64(substr_len(rest2, 0, sep2));
+}
+
+// Get number of columns in result set
+fn mysql_num_cols(result: str) -> i32 {
+    if (!mysql_is_result_set(result)) { return 0; }
+    let rest: str = substr(result, 3);
+    let sep_pos: i32 = str_find(rest, my_sep());
+    if (sep_pos < 0) { return 0; }
+    return str_to_i32(substr_len(rest, 0, sep_pos));
+}
+
+// Count rows in result set
+fn mysql_num_rows(result: str) -> i32 {
+    if (!mysql_is_result_set(result)) { return 0; }
+    let count: i32 = 0;
+    let i: i32 = 0;
+    let rlen: i32 = len(result);
+    while (i < rlen) {
+        if (byte_at(result, i) == 2) { count = count + 1; }
+        i = i + 1;
+    }
+    return count;
+}
+
+// Get column name by index
+fn mysql_col_name(result: str, col: i32) -> str {
+    if (!mysql_is_result_set(result)) { return ""; }
+    let rest: str = substr(result, 3);
+    let fields_to_skip: i32 = col + 1;
+    let i: i32 = 0;
+    while (i < fields_to_skip) {
+        let spos: i32 = str_find(rest, my_sep());
+        if (spos < 0) { return ""; }
+        rest = substr(rest, spos + 1);
+        i = i + 1;
+    }
+    // Scan byte-by-byte until sep(1) or row_sep(2) or end
+    let name: str = "";
+    let j: i32 = 0;
+    while (j < len(rest)) {
+        let ch: i32 = byte_at(rest, j);
+        if (ch == 1 || ch == 2) { break; }
+        let tmp: str = "x";
+        store8(ptr(tmp), ch);
+        name = name + tmp;
+        j = j + 1;
+    }
+    return name;
+}
+
+// Get cell value by row and column index
+fn mysql_get(result: str, row: i32, col: i32) -> str {
+    if (!mysql_is_result_set(result)) { return ""; }
+
+    // Find the target row by scanning for byte value 2 (row_sep)
+    let rest: str = result;
+    let ri: i32 = 0;
+    while (ri <= row) {
+        let found: i32 = -1;
+        let k: i32 = 0;
+        while (k < len(rest)) {
+            if (byte_at(rest, k) == 2) { found = k; break; }
+            k = k + 1;
+        }
+        if (found < 0) { return ""; }
+        rest = substr(rest, found + 1);
+        ri = ri + 1;
+    }
+
+    // Now in the target row, skip `col` separators
+    let ci: i32 = 0;
+    while (ci < col) {
+        let spos: i32 = str_find(rest, my_sep());
+        if (spos < 0) { return ""; }
+        rest = substr(rest, spos + 1);
+        ci = ci + 1;
+    }
+
+    // Read value until next sep(1), row_sep(2), or end
+    let val: str = "";
+    let j: i32 = 0;
+    while (j < len(rest)) {
+        let ch: i32 = byte_at(rest, j);
+        if (ch == 1 || ch == 2) { break; }
+        let tmp: str = "x";
+        store8(ptr(tmp), ch);
+        val = val + tmp;
+        j = j + 1;
+    }
+    return val;
+}
+
+// Check if a cell is NULL
+fn mysql_is_null(result: str, row: i32, col: i32) -> bool {
+    let val: str = mysql_get(result, row, col);
+    if (len(val) != 1) { return false; }
+    return byte_at(val, 0) == 3;
+}
+
+// ============================================================================
+// SQL Escaping (SECURITY CRITICAL)
+// ============================================================================
+
+// Escape a string for safe inclusion in SQL queries.
+// Handles: ' " \ NUL \n \r \x1A (Ctrl-Z)
+fn mysql_escape(s: str) -> str {
+    let result: str = "";
+    let slen: i32 = len(s);
+    let i: i32 = 0;
+    while (i < slen) {
+        let c: i32 = byte_at(s, i);
+        if (c == 0) {
+            result = result + "\\0";
+        } else if (c == 10) {
+            result = result + "\\n";
+        } else if (c == 13) {
+            result = result + "\\r";
+        } else if (c == 26) {
+            result = result + "\\Z";
+        } else if (c == 39) {
+            result = result + "\\'";
+        } else if (c == 34) {
+            result = result + "\\\"";
+        } else if (c == 92) {
+            result = result + "\\\\";
+        } else {
+            result = result + s[i];
+        }
+        i = i + 1;
+    }
+    return result;
+}
+
+// Escape and quote a string value: returns 'escaped_value'
+fn mysql_quote(s: str) -> str {
+    return "'" + mysql_escape(s) + "'";
+}
+
+// Escape an identifier (table/column name) with backticks
+fn mysql_escape_id(s: str) -> str {
+    let result: str = "`";
+    let slen: i32 = len(s);
+    let i: i32 = 0;
+    while (i < slen) {
+        if (s[i] == '`') {
+            result = result + "``";
+        } else {
+            result = result + s[i];
+        }
+        i = i + 1;
+    }
+    return result + "`";
+}
+
+// ============================================================================
+// Prepared Statements (COM_STMT_PREPARE / COM_STMT_EXECUTE / COM_STMT_CLOSE)
+// ============================================================================
+
+// Prepare a statement. Returns statement ID or -1 on error.
+fn mysql_prepare(fd: i32, sql: str) -> i32 {
+    let sql_len: i32 = len(sql);
+    let pkt: str = make_buffer(1 + sql_len);
+    my_buf_set(pkt, 0, 22);
+    my_buf_copy(pkt, 1, sql, 0, sql_len);
+    mysql_write_packet(fd, 0, pkt, 1 + sql_len);
+
+    let resp: str = mysql_read_packet(fd);
+    if (my_pkt_len(resp) < 1) { return -1; }
+    if (my_pkt_byte(resp, 0) != 0) { return -1; }
+
+    let stmt_id: i32 = my_to_i32(my_read_u32(resp, 5));
+    let num_cols: i32 = my_read_u16(resp, 9);
+    let num_params: i32 = my_read_u16(resp, 11);
+
+    // Read param definition packets + EOF
+    if (num_params > 0) {
+        let pi: i32 = 0;
+        while (pi < num_params) {
+            mysql_read_packet(fd);
+            pi = pi + 1;
+        }
+        mysql_read_packet(fd);
+    }
+
+    // Read column definition packets + EOF
+    if (num_cols > 0) {
+        let ci: i32 = 0;
+        while (ci < num_cols) {
+            mysql_read_packet(fd);
+            ci = ci + 1;
+        }
+        mysql_read_packet(fd);
+    }
+
+    return stmt_id;
+}
+
+// Build a parameter buffer for prepared statement execution.
+// Parameters are encoded as: count (4 bytes) + entries
+// Each entry: type (1 byte: 's'=string, 'i'=i32, 'l'=i64, 'n'=null) + data
+fn mysql_params_new(count: i32) -> str {
+    let buf: str = make_buffer(4096);
+    my_write_u32(buf, 0, my_to_i64(count));
+    my_buf_set(buf, 4, 0);
+    return buf;
+}
+
+// Internal: find the write position in params buffer
+fn my_params_end(params: str) -> i32 {
+    let pos: i32 = 4;
+    let count: i32 = my_to_i32(my_read_u32(params, 0));
+    let i: i32 = 0;
+    while (i < count) {
+        let t: i32 = my_buf_get(params, pos);
+        if (t == 0) { return pos; }
+        pos = pos + 1;
+        if (t == 110) {
+            // null: no data
+        } else if (t == 105) {
+            pos = pos + 4;
+        } else if (t == 108) {
+            pos = pos + 8;
+        } else if (t == 115) {
+            let slen: i32 = my_to_i32(my_read_u32(params, pos));
+            pos = pos + 4 + slen;
+        }
+        i = i + 1;
+    }
+    return pos;
+}
+
+// Bind a string parameter
+fn mysql_bind_str(params: str, index: i32, value: str) -> str {
+    let pos: i32 = my_params_end(params);
+    my_buf_set(params, pos, 115);
+    pos = pos + 1;
+    let vlen: i32 = len(value);
+    my_write_u32(params, pos, my_to_i64(vlen));
+    pos = pos + 4;
+    my_buf_copy(params, pos, value, 0, vlen);
+    return params;
+}
+
+// Bind an i32 parameter
+fn mysql_bind_i32(params: str, index: i32, value: i32) -> str {
+    let pos: i32 = my_params_end(params);
+    my_buf_set(params, pos, 105);
+    pos = pos + 1;
+    my_write_u32(params, pos, my_to_i64(value));
+    return params;
+}
+
+// Bind a NULL parameter
+fn mysql_bind_null(params: str, index: i32) -> str {
+    let pos: i32 = my_params_end(params);
+    my_buf_set(params, pos, 110);
+    return params;
+}
+
+// Execute a prepared statement with parameters. Returns result string.
+fn mysql_stmt_execute(fd: i32, stmt_id: i32, params: str, num_params: i32) -> str {
+    // Header: 1 + 4 + 1 + 4 = 10 bytes
+    // NULL bitmap: (num_params + 7) / 8
+    // New params flag: 1
+    // Param types: 2 * num_params
+    // Param values: variable
+    let null_bitmap_len: i32 = (num_params + 7) / 8;
+    let max_pkt: i32 = 10 + null_bitmap_len + 1 + 2 * num_params + 4096;
+    let pkt: str = make_buffer(max_pkt);
+    let poff: i32 = 0;
+
+    my_buf_set(pkt, poff, 23);
+    poff = poff + 1;
+
+    my_write_u32(pkt, poff, my_to_i64(stmt_id));
+    poff = poff + 4;
+
+    my_buf_set(pkt, poff, 0);
+    poff = poff + 1;
+
+    my_write_u32(pkt, poff, 1);
+    poff = poff + 4;
+
+    if (num_params > 0) {
+        // NULL bitmap
+        let null_bm_start: i32 = poff;
+        let bi: i32 = 0;
+        while (bi < null_bitmap_len) {
+            my_buf_set(pkt, poff + bi, 0);
+            bi = bi + 1;
+        }
+
+        // Check each param for NULL
+        let param_pos: i32 = 4;
+        let pi: i32 = 0;
+        while (pi < num_params) {
+            let pt: i32 = my_buf_get(params, param_pos);
+            if (pt == 110) {
+                // Set NULL bit
+                let byte_idx: i32 = pi / 8;
+                let bit_idx: i32 = pi - byte_idx * 8;
+                let cur: i32 = my_buf_get(pkt, null_bm_start + byte_idx);
+                let bit_val: i32 = 1;
+                let si: i32 = 0;
+                while (si < bit_idx) { bit_val = bit_val * 2; si = si + 1; }
+                my_buf_set(pkt, null_bm_start + byte_idx, cur + bit_val - (cur & bit_val));
+                param_pos = param_pos + 1;
+            } else if (pt == 105) {
+                param_pos = param_pos + 5;
+            } else if (pt == 108) {
+                param_pos = param_pos + 9;
+            } else if (pt == 115) {
+                let slen: i32 = my_to_i32(my_read_u32(params, param_pos + 1));
+                param_pos = param_pos + 5 + slen;
+            } else {
+                param_pos = param_pos + 1;
+            }
+            pi = pi + 1;
+        }
+        poff = poff + null_bitmap_len;
+
+        // New params bound flag
+        my_buf_set(pkt, poff, 1);
+        poff = poff + 1;
+
+        // Parameter types (2 bytes each)
+        param_pos = 4;
+        pi = 0;
+        while (pi < num_params) {
+            let pt: i32 = my_buf_get(params, param_pos);
+            if (pt == 110) {
+                my_buf_set(pkt, poff, 6);
+                my_buf_set(pkt, poff + 1, 0);
+                param_pos = param_pos + 1;
+            } else if (pt == 105) {
+                my_buf_set(pkt, poff, 3);
+                my_buf_set(pkt, poff + 1, 0);
+                param_pos = param_pos + 5;
+            } else if (pt == 108) {
+                my_buf_set(pkt, poff, 8);
+                my_buf_set(pkt, poff + 1, 0);
+                param_pos = param_pos + 9;
+            } else if (pt == 115) {
+                my_buf_set(pkt, poff, 253);
+                my_buf_set(pkt, poff + 1, 0);
+                let slen: i32 = my_to_i32(my_read_u32(params, param_pos + 1));
+                param_pos = param_pos + 5 + slen;
+            }
+            poff = poff + 2;
+            pi = pi + 1;
+        }
+
+        // Parameter values
+        param_pos = 4;
+        pi = 0;
+        while (pi < num_params) {
+            let pt: i32 = my_buf_get(params, param_pos);
+            if (pt == 110) {
+                param_pos = param_pos + 1;
+            } else if (pt == 105) {
+                my_buf_copy(pkt, poff, params, param_pos + 1, 4);
+                poff = poff + 4;
+                param_pos = param_pos + 5;
+            } else if (pt == 108) {
+                my_buf_copy(pkt, poff, params, param_pos + 1, 8);
+                poff = poff + 8;
+                param_pos = param_pos + 9;
+            } else if (pt == 115) {
+                let slen: i32 = my_to_i32(my_read_u32(params, param_pos + 1));
+                // Write length-encoded string length
+                if (slen < 251) {
+                    my_buf_set(pkt, poff, slen);
+                    poff = poff + 1;
+                } else {
+                    my_buf_set(pkt, poff, 252);
+                    my_write_u16(pkt, poff + 1, slen);
+                    poff = poff + 3;
+                }
+                my_buf_copy(pkt, poff, params, param_pos + 5, slen);
+                poff = poff + slen;
+                param_pos = param_pos + 5 + slen;
+            }
+            pi = pi + 1;
+        }
+    }
+
+    mysql_write_packet(fd, 0, pkt, poff);
+
+    // Read response - similar to mysql_query
+    let resp: str = mysql_read_packet(fd);
+    if (my_pkt_len(resp) < 1) { return "ERR" + my_sep() + "0" + my_sep() + "empty response"; }
+
+    let first: i32 = my_pkt_byte(resp, 0);
+    if (first == 0) { return my_parse_ok(resp); }
+    if (first == 255) { return my_parse_err(resp); }
+
+    // Binary result set
+    let num_cols: i32 = my_to_i32(my_read_lenenc_val(resp, 4));
+    let result: str = "RS" + my_sep() + i32_to_str(num_cols);
+
+    // Column definitions
+    let ci: i32 = 0;
+    while (ci < num_cols) {
+        let col_pkt: str = mysql_read_packet(fd);
+        let coff: i32 = 4;
+        let skip: i32 = 0;
+        while (skip < 4) {
+            let slen: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
+            coff = coff + my_lenenc_size(col_pkt, coff) + slen;
+            skip = skip + 1;
+        }
+        let name_len: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
+        coff = coff + my_lenenc_size(col_pkt, coff);
+        let col_name: str = "";
+        let ni: i32 = 0;
+        while (ni < name_len) {
+            let ch: i32 = my_buf_get(col_pkt, coff + ni);
+            let tmp: str = "x";
+            store8(ptr(tmp), ch);
+            col_name = col_name + tmp;
+            ni = ni + 1;
+        }
+        result = result + my_sep() + col_name;
+        ci = ci + 1;
+    }
+
+    // EOF after columns
+    mysql_read_packet(fd);
+
+    // Binary row data
+    let row_sep: str = my_row_sep();
+    let null_m: str = my_null_marker();
+    let reading: bool = true;
+    while (reading) {
+        let row_pkt: str = mysql_read_packet(fd);
+        if (my_pkt_len(row_pkt) < 1) { break; }
+        let rf: i32 = my_pkt_byte(row_pkt, 0);
+        if (rf == 254 && my_pkt_len(row_pkt) < 9) {
+            reading = false;
+        } else if (rf == 255) {
+            reading = false;
+        } else {
+            // Binary row: 1 byte header (0x00) + NULL bitmap + values
+            let null_bm_off: i32 = 5;
+            let null_bm_bytes: i32 = (num_cols + 7 + 2) / 8;
+            let val_off: i32 = null_bm_off + null_bm_bytes;
+            result = result + row_sep;
+
+            let col_i: i32 = 0;
+            while (col_i < num_cols) {
+                if (col_i > 0) { result = result + my_sep(); }
+                // Check NULL bitmap (offset by 2 bits)
+                let bit_pos: i32 = col_i + 2;
+                let bm_byte: i32 = bit_pos / 8;
+                let bm_bit: i32 = bit_pos - bm_byte * 8;
+                let bm_val: i32 = my_buf_get(row_pkt, null_bm_off + bm_byte);
+                let bit_check: i32 = 1;
+                let bsi: i32 = 0;
+                while (bsi < bm_bit) { bit_check = bit_check * 2; bsi = bsi + 1; }
+                if ((bm_val & bit_check) != 0) {
+                    result = result + null_m;
+                } else {
+                    // Read value as length-encoded string (text representation)
+                    let vlen: i32 = my_to_i32(my_read_lenenc_val(row_pkt, val_off));
+                    val_off = val_off + my_lenenc_size(row_pkt, val_off);
+                    let val: str = "";
+                    let vi: i32 = 0;
+                    while (vi < vlen) {
+                        let ch: i32 = my_buf_get(row_pkt, val_off + vi);
+                        let tmp: str = "x";
+                        store8(ptr(tmp), ch);
+                        val = val + tmp;
+                        vi = vi + 1;
+                    }
+                    result = result + val;
+                    val_off = val_off + vlen;
+                }
+                col_i = col_i + 1;
+            }
+        }
+    }
+
+    return result;
+}
+
+// Close a prepared statement
+fn mysql_stmt_close(fd: i32, stmt_id: i32) -> void {
+    let pkt: str = make_buffer(5);
+    my_buf_set(pkt, 0, 25);
+    my_write_u32(pkt, 1, my_to_i64(stmt_id));
+    mysql_write_packet(fd, 0, pkt, 5);
+}
+
+// Reset a prepared statement (clear bound parameters)
+fn mysql_stmt_reset(fd: i32, stmt_id: i32) -> bool {
+    let pkt: str = make_buffer(5);
+    my_buf_set(pkt, 0, 26);
+    my_write_u32(pkt, 1, my_to_i64(stmt_id));
+    mysql_write_packet(fd, 0, pkt, 5);
+    let resp: str = mysql_read_packet(fd);
+    if (my_pkt_len(resp) < 1) { return false; }
+    return my_pkt_byte(resp, 0) == 0;
+}
+
+// ============================================================================
+// Transactions
+// ============================================================================
+
+fn mysql_begin(fd: i32) -> str {
+    return mysql_query(fd, "START TRANSACTION");
+}
+
+fn mysql_commit(fd: i32) -> str {
+    return mysql_query(fd, "COMMIT");
+}
+
+fn mysql_rollback(fd: i32) -> str {
+    return mysql_query(fd, "ROLLBACK");
+}
+
+fn mysql_autocommit_on(fd: i32) -> str {
+    return mysql_query(fd, "SET autocommit = 1");
+}
+
+fn mysql_autocommit_off(fd: i32) -> str {
+    return mysql_query(fd, "SET autocommit = 0");
+}
+
+// ============================================================================
+// Convenience query helpers
+// ============================================================================
+
+// Execute a query that returns no results (INSERT/UPDATE/DELETE/DDL)
+fn mysql_exec(fd: i32, sql: str) -> bool {
+    let result: str = mysql_query(fd, sql);
+    return !mysql_is_error(result);
+}
+
+// Select a single value (first row, first column)
+fn mysql_query_scalar(fd: i32, sql: str) -> str {
+    let result: str = mysql_query(fd, sql);
+    if (mysql_is_error(result)) { return ""; }
+    if (!mysql_is_result_set(result)) { return ""; }
+    if (mysql_num_rows(result) < 1) { return ""; }
+    return mysql_get(result, 0, 0);
+}
+
+// Select a single row as comma-separated values
+fn mysql_query_row(fd: i32, sql: str) -> str {
+    let result: str = mysql_query(fd, sql);
+    if (!mysql_is_result_set(result)) { return ""; }
+    if (mysql_num_rows(result) < 1) { return ""; }
+    let ncols: i32 = mysql_num_cols(result);
+    let row: str = "";
+    let i: i32 = 0;
+    while (i < ncols) {
+        if (i > 0) { row = row + ","; }
+        row = row + mysql_get(result, 0, i);
+        i = i + 1;
+    }
+    return row;
+}
+
+// ============================================================================
+// Secure parameterized query builder
+// Replaces ? placeholders with properly escaped values.
+// This is an alternative to COM_STMT_PREPARE for simple queries.
+// ============================================================================
+
+// Replace the first ? in `sql` with escaped string `val`
+fn mysql_set_param_str(sql: str, val: str) -> str {
+    let qpos: i32 = str_find(sql, "?");
+    if (qpos < 0) { return sql; }
+    let before: str = substr_len(sql, 0, qpos);
+    let after: str = substr(sql, qpos + 1);
+    return before + mysql_quote(val) + after;
+}
+
+// Replace the first ? in `sql` with integer `val`
+fn mysql_set_param_i32(sql: str, val: i32) -> str {
+    let qpos: i32 = str_find(sql, "?");
+    if (qpos < 0) { return sql; }
+    let before: str = substr_len(sql, 0, qpos);
+    let after: str = substr(sql, qpos + 1);
+    return before + i32_to_str(val) + after;
+}
+
+// Replace the first ? in `sql` with i64 `val`
+fn mysql_set_param_i64(sql: str, val: i64) -> str {
+    let qpos: i32 = str_find(sql, "?");
+    if (qpos < 0) { return sql; }
+    let before: str = substr_len(sql, 0, qpos);
+    let after: str = substr(sql, qpos + 1);
+    return before + i64_to_str(val) + after;
+}
+
+// Replace the first ? in `sql` with NULL
+fn mysql_set_param_null(sql: str) -> str {
+    let qpos: i32 = str_find(sql, "?");
+    if (qpos < 0) { return sql; }
+    let before: str = substr_len(sql, 0, qpos);
+    let after: str = substr(sql, qpos + 1);
+    return before + "NULL" + after;
+}
+
+// ============================================================================
+// Database / schema helpers
+// ============================================================================
+
+fn mysql_use_db(fd: i32, database: str) -> str {
+    return mysql_query(fd, "USE " + mysql_escape_id(database));
+}
+
+fn mysql_list_databases(fd: i32) -> str {
+    return mysql_query(fd, "SHOW DATABASES");
+}
+
+fn mysql_list_tables(fd: i32) -> str {
+    return mysql_query(fd, "SHOW TABLES");
+}
+
+fn mysql_table_exists(fd: i32, table: str) -> bool {
+    let sql: str = "SELECT COUNT(*) FROM information_schema.tables WHERE table_schema = DATABASE() AND table_name = " + mysql_quote(table);
+    let val: str = mysql_query_scalar(fd, sql);
+    return val == "1";
+}
+
+// ============================================================================
+// Server info
+// ============================================================================
+
+fn mysql_server_version(fd: i32) -> str {
+    return mysql_query_scalar(fd, "SELECT VERSION()");
+}
+
+fn mysql_current_database(fd: i32) -> str {
+    return mysql_query_scalar(fd, "SELECT DATABASE()");
+}
+
+fn mysql_current_user(fd: i32) -> str {
+    return mysql_query_scalar(fd, "SELECT CURRENT_USER()");
+}
