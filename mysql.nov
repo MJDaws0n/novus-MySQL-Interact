@@ -152,6 +152,7 @@ fn my_lenenc_size(buf: str, off: i32) -> i32 {
 
 // Read exactly `length` bytes from socket into a buffer
 fn my_read_exact(fd: i32, length: i32) -> str {
+    print("[read_exact] want=" + int_to_str(length) + "\n");
     let result: str = make_buffer(length);
     let dest: u64 = ptr(result);
     let total: i32 = 0;
@@ -160,6 +161,7 @@ fn my_read_exact(fd: i32, length: i32) -> str {
         let want: i32 = length - total;
         if (want > 4096) { want = 4096; }
         let got: i32 = net_read(fd, tmp, want);
+        print("[read_exact] got=" + int_to_str(got) + "\n");
         if (got <= 0) { break; }
         let i: i32 = 0;
         while (i < got) {
@@ -169,6 +171,7 @@ fn my_read_exact(fd: i32, length: i32) -> str {
         }
         total = total + got;
     }
+    print("[read_exact] done total=" + int_to_str(total) + "\n");
     return result;
 }
 
@@ -176,10 +179,13 @@ fn my_read_exact(fd: i32, length: i32) -> str {
 // Bytes 4+: payload data
 // Returns empty string on error.
 fn mysql_read_packet(fd: i32) -> str {
+    print("[mysql_pkt] reading header\n");
     let header: str = my_read_exact(fd, 4);
+    print("[mysql_pkt] header read, len(header)=" + int_to_str(len(header)) + "\n");
     let payload_len: i32 = my_buf_get(header, 0) +
                            my_buf_get(header, 1) * 256 +
                            my_buf_get(header, 2) * 65536;
+    print("[mysql_pkt] payload_len=" + int_to_str(payload_len) + "\n");
     if (payload_len <= 0) { return ""; }
     let result: str = make_buffer(4 + payload_len);
     // Encode length with +1 per byte to avoid null terminators
@@ -204,6 +210,7 @@ fn mysql_read_packet(fd: i32) -> str {
         }
         total = total + got;
     }
+    print("[mysql_pkt] read complete total=" + int_to_str(total) + "\n");
     return result;
 }
 
