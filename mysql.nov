@@ -30,7 +30,9 @@ fn my_buf_copy(dst: str, dst_off: i32, src: str, src_off: i32, count: i32) -> vo
     let da: u64 = ptr(dst);
     let i: i32 = 0;
     while (i < count) {
-        store8(da + i32_to_u64(dst_off + i), byte_at(src, src_off + i));
+        // Separate byte_at from store8 to avoid register clobbering on ARM64
+        let b: i32 = byte_at(src, src_off + i);
+        store8(da + i32_to_u64(dst_off + i), b);
         i = i + 1;
     }
 }
@@ -85,7 +87,8 @@ fn my_write_cstr(buf: str, off: i32, s: str) -> i32 {
     let addr: u64 = ptr(buf);
     let i: i32 = 0;
     while (i < slen) {
-        store8(addr + i32_to_u64(off + i), byte_at(s, i));
+        let b: i32 = byte_at(s, i);
+        store8(addr + i32_to_u64(off + i), b);
         i = i + 1;
     }
     store8(addr + i32_to_u64(off + slen), 0);
@@ -162,15 +165,10 @@ fn my_read_exact(fd: i32, length: i32) -> str {
         if (got <= 0) { break; }
         let i: i32 = 0;
         while (i < got) {
-            store8(dest + i32_to_u64(total + i), byte_at(tmp, i));
+            let b: i32 = byte_at(tmp, i);
+            store8(dest + i32_to_u64(total + i), b);
             i = i + 1;
         }
-        total = total + got;
-    }
-    return result;
-}
-
-// Read a MySQL packet. Returns length-prefixed buffer:
 // Bytes 0-3: payload length encoded with +1 offset (avoids null bytes breaking len())
 // Bytes 4+: payload data
 // Returns empty string on error.
@@ -197,7 +195,8 @@ fn mysql_read_packet(fd: i32) -> str {
         if (got <= 0) { break; }
         let i: i32 = 0;
         while (i < got) {
-            store8(dest + i32_to_u64(4 + total + i), byte_at(tmp, i));
+            let b: i32 = byte_at(tmp, i);
+            store8(dest + i32_to_u64(4 + total + i), b);
             i = i + 1;
         }
         total = total + got;

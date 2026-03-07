@@ -180,7 +180,8 @@ fn sha1_hash(data: str, data_len: i32) -> str {
 
     let i: i32 = 0;
     while (i < data_len) {
-        store8(paddr + i32_to_u64(i), byte_at(data, i));
+        let b: i32 = byte_at(data, i);
+        store8(paddr + i32_to_u64(i), b);
         i = i + 1;
     }
 
@@ -209,7 +210,8 @@ fn sha1_hash(data: str, data_len: i32) -> str {
         let baddr: u64 = ptr(block);
         let j: i32 = 0;
         while (j < 64) {
-            store8(baddr + i32_to_u64(j), byte_at(padded, i + j));
+            let b: i32 = byte_at(padded, i + j);
+            store8(baddr + i32_to_u64(j), b);
             j = j + 1;
         }
         sha1_process_block(state, block);
@@ -241,12 +243,14 @@ fn sha1_concat(a: str, a_len: i32, b: str, b_len: i32) -> str {
     let raddr: u64 = ptr(result);
     let i: i32 = 0;
     while (i < a_len) {
-        store8(raddr + i32_to_u64(i), byte_at(a, i));
+        let ba: i32 = byte_at(a, i);
+        store8(raddr + i32_to_u64(i), ba);
         i = i + 1;
     }
     i = 0;
     while (i < b_len) {
-        store8(raddr + i32_to_u64(a_len + i), byte_at(b, i));
+        let bb: i32 = byte_at(b, i);
+        store8(raddr + i32_to_u64(a_len + i), bb);
         i = i + 1;
     }
     return result;
