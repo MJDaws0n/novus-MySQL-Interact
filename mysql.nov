@@ -169,6 +169,11 @@ fn my_read_exact(fd: i32, length: i32) -> str {
             store8(dest + i32_to_u64(total + i), b);
             i = i + 1;
         }
+        total = total + got;
+    }
+    return result;
+}
+
 // Bytes 0-3: payload length encoded with +1 offset (avoids null bytes breaking len())
 // Bytes 4+: payload data
 // Returns empty string on error.
