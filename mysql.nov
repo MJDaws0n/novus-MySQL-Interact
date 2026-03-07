@@ -101,9 +101,7 @@ fn my_read_cstr(buf: str, off: i32) -> str {
     let i: i32 = off;
     while (my_buf_get(buf, i) != 0) {
         let ch: i32 = my_buf_get(buf, i);
-        let tmp: str = "x";
-        store8(ptr(tmp), ch);
-        result = result + tmp;
+        result = result + _byte_to_char(ch);
         i = i + 1;
     }
     return result;
@@ -513,9 +511,7 @@ fn my_parse_err(pkt: str) -> str {
     while (i < pkt_len) {
         let ch: i32 = my_buf_get(pkt, i);
         if (ch == 0) { break; }
-        let tmp: str = "x";
-        store8(ptr(tmp), ch);
-        msg = msg + tmp;
+        msg = msg + _byte_to_char(ch);
         i = i + 1;
     }
     let r: str = "ERR";
@@ -577,9 +573,7 @@ fn mysql_query(fd: i32, sql: str) -> str {
         let ni: i32 = 0;
         while (ni < name_len) {
             let ch: i32 = my_buf_get(col_pkt, coff + ni);
-            let tmp: str = "x";
-            store8(ptr(tmp), ch);
-            col_name = col_name + tmp;
+            col_name = col_name + _byte_to_char(ch);
             ni = ni + 1;
         }
         result = result + my_sep() + col_name;
@@ -622,9 +616,7 @@ fn mysql_query(fd: i32, sql: str) -> str {
                     let vi: i32 = 0;
                     while (vi < val_len) {
                         let ch: i32 = my_buf_get(row_pkt, roff + vi);
-                        let tmp: str = "x";
-                        store8(ptr(tmp), ch);
-                        val = val + tmp;
+                        val = val + _byte_to_char(ch);
                         vi = vi + 1;
                     }
                     result = result + val;
@@ -736,9 +728,7 @@ fn mysql_col_name(result: str, col: i32) -> str {
     while (j < len(rest)) {
         let ch: i32 = byte_at(rest, j);
         if (ch == 1 || ch == 2) { break; }
-        let tmp: str = "x";
-        store8(ptr(tmp), ch);
-        name = name + tmp;
+        name = name + _byte_to_char(ch);
         j = j + 1;
     }
     return name;
@@ -778,9 +768,7 @@ fn mysql_get(result: str, row: i32, col: i32) -> str {
     while (j < len(rest)) {
         let ch: i32 = byte_at(rest, j);
         if (ch == 1 || ch == 2) { break; }
-        let tmp: str = "x";
-        store8(ptr(tmp), ch);
-        val = val + tmp;
+        val = val + _byte_to_char(ch);
         j = j + 1;
     }
     return val;
@@ -820,7 +808,7 @@ fn mysql_escape(s: str) -> str {
         } else if (c == 92) {
             result = result + "\\\\";
         } else {
-            result = result + s[i];
+            result = result + _byte_to_char(byte_at(s, i));
         }
         i = i + 1;
     }
@@ -838,10 +826,10 @@ fn mysql_escape_id(s: str) -> str {
     let slen: i32 = len(s);
     let i: i32 = 0;
     while (i < slen) {
-        if (s[i] == '`') {
+        if (byte_at(s, i) == 96) {
             result = result + "``";
         } else {
-            result = result + s[i];
+            result = result + _byte_to_char(byte_at(s, i));
         }
         i = i + 1;
     }
@@ -1111,9 +1099,7 @@ fn mysql_stmt_execute(fd: i32, stmt_id: i32, params: str, num_params: i32) -> st
         let ni: i32 = 0;
         while (ni < name_len) {
             let ch: i32 = my_buf_get(col_pkt, coff + ni);
-            let tmp: str = "x";
-            store8(ptr(tmp), ch);
-            col_name = col_name + tmp;
+            col_name = col_name + _byte_to_char(ch);
             ni = ni + 1;
         }
         result = result + my_sep() + col_name;
@@ -1163,9 +1149,7 @@ fn mysql_stmt_execute(fd: i32, stmt_id: i32, params: str, num_params: i32) -> st
                     let vi: i32 = 0;
                     while (vi < vlen) {
                         let ch: i32 = my_buf_get(row_pkt, val_off + vi);
-                        let tmp: str = "x";
-                        store8(ptr(tmp), ch);
-                        val = val + tmp;
+                        val = val + _byte_to_char(ch);
                         vi = vi + 1;
                     }
                     result = result + val;
