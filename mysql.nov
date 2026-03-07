@@ -467,21 +467,15 @@ fn mysql_ping(fd: i32) -> bool {
 // ============================================================================
 
 fn my_sep() -> str {
-    let s: str = make_buffer(1);
-    store8(ptr(s), 1);
-    return s;
+    return _byte_to_char(1);
 }
 
 fn my_row_sep() -> str {
-    let s: str = make_buffer(1);
-    store8(ptr(s), 2);
-    return s;
+    return _byte_to_char(2);
 }
 
 fn my_null_marker() -> str {
-    let s: str = make_buffer(1);
-    store8(ptr(s), 3);
-    return s;
+    return _byte_to_char(3);
 }
 
 // Parse an OK packet into result string
