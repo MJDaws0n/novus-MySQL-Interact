@@ -462,20 +462,21 @@ fn mysql_ping(fd: i32) -> bool {
 
 // ============================================================================
 // Result format (internal encoding)
-// Fields separated by \x01 (SOH), rows by \x02 (STX), NULL as \x03 (ETX)
-// Prefix: "OK\x01...", "RS\x01...", "ERR\x01..."
+// Fields separated by \t (TAB), rows by \n (LF), NULL as \r (CR)
+// Prefix: "OK\t...", "RS\t...", "ERR\t..."
+// NOTE: Using printable-safe control chars that Novus supports as escape sequences.
 // ============================================================================
 
 fn my_sep() -> str {
-    return _byte_to_char(1);
+    return "\t";
 }
 
 fn my_row_sep() -> str {
-    return _byte_to_char(2);
+    return "\n";
 }
 
 fn my_null_marker() -> str {
-    return _byte_to_char(3);
+    return "\r";
 }
 
 // Parse an OK packet into result string
@@ -698,7 +699,7 @@ fn mysql_num_rows(result: str) -> i32 {
     let i: i32 = 0;
     let rlen: i32 = len(result);
     while (i < rlen) {
-        if (byte_at(result, i) == 2) { count = count + 1; }
+        if (byte_at(result, i) == 10) { count = count + 1; }
         i = i + 1;
     }
     return count;
@@ -739,7 +740,7 @@ fn mysql_get(result: str, row: i32, col: i32) -> str {
         let found: i32 = -1;
         let k: i32 = 0;
         while (k < len(rest)) {
-            if (byte_at(rest, k) == 2) { found = k; break; }
+            if (byte_at(rest, k) == 10) { found = k; break; }
             k = k + 1;
         }
         if (found < 0) { return ""; }
@@ -772,7 +773,7 @@ fn mysql_get(result: str, row: i32, col: i32) -> str {
 fn mysql_is_null(result: str, row: i32, col: i32) -> bool {
     let val: str = mysql_get(result, row, col);
     if (len(val) != 1) { return false; }
-    return byte_at(val, 0) == 3;
+    return byte_at(val, 0) == 13;
 }
 
 // ============================================================================
