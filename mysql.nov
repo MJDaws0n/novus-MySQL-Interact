@@ -237,23 +237,29 @@ fn mysql_write_packet(fd: i32, seq: i32, data: str, data_len: i32) -> void {
 // Connect to MySQL and authenticate. Returns fd on success, -1 on failure.
 fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
                  user: str, password: str, database: str) -> i32 {
+    print("[mysql_connect] starting\n");
     net_ignore_sigpipe();
     let fd: i32 = net_socket();
+    print("[mysql_connect] socket fd=" + int_to_str(fd) + "\n");
     if (fd < 0) { return -1; }
     let rc: i32 = net_connect(fd, a, b, c, d, port);
+    print("[mysql_connect] connect rc=" + int_to_str(rc) + "\n");
     if (rc < 0) {
         net_close(fd);
         return -1;
     }
 
     // Read server greeting
+    print("[mysql_connect] reading greeting...\n");
     let greeting: str = mysql_read_packet(fd);
+    print("[mysql_connect] greeting len=" + int_to_str(my_pkt_len(greeting)) + "\n");
     if (my_pkt_len(greeting) < 1) {
         net_close(fd);
         return -1;
     }
 
     let proto_ver: i32 = my_pkt_byte(greeting, 0);
+    print("[mysql_connect] proto_ver=" + int_to_str(proto_ver) + "\n");
     if (proto_ver != 10) {
         net_close(fd);
         return -1;
