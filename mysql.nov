@@ -237,23 +237,28 @@ fn mysql_write_packet(fd: i32, seq: i32, data: str, data_len: i32) -> void {
 // Connect to MySQL and authenticate. Returns fd on success, -1 on failure.
 fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
                  user: str, password: str, database: str) -> i32 {
+    print("[mysql] connect start\n");
     net_ignore_sigpipe();
     let fd: i32 = net_socket();
-    if (fd < 0) { return -1; }
+    if (fd < 0) { print("[mysql] socket failed\n"); return -1; }
     let rc: i32 = net_connect(fd, a, b, c, d, port);
     if (rc < 0) {
+        print("[mysql] connect failed\n");
         net_close(fd);
         return -1;
     }
+    print("[mysql] connected, reading greeting\n");
 
     // Read server greeting
     let greeting: str = mysql_read_packet(fd);
+    print("[mysql] greeting len=" + int_to_str(my_pkt_len(greeting)) + "\n");
     if (my_pkt_len(greeting) < 1) {
         net_close(fd);
         return -1;
     }
 
     let proto_ver: i32 = my_pkt_byte(greeting, 0);
+    print("[mysql] proto=" + int_to_str(proto_ver) + "\n");
     if (proto_ver != 10) {
         net_close(fd);
         return -1;
@@ -376,20 +381,26 @@ fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
     poff = poff + my_write_cstr(pkt, poff, auth_plugin);
 
     // Send auth packet (sequence = 1)
+    print("[mysql] sending auth pkt len=" + int_to_str(poff) + "\n");
     mysql_write_packet(fd, 1, pkt, poff);
 
     // Read auth result
+    print("[mysql] reading auth response\n");
     let resp: str = mysql_read_packet(fd);
     let resp_len: i32 = my_pkt_len(resp);
+    print("[mysql] auth resp len=" + int_to_str(resp_len) + "\n");
     if (resp_len < 1) {
         net_close(fd);
         return -1;
     }
 
     let resp_type: i32 = my_pkt_byte(resp, 0);
+    print("[mysql] auth resp type=" + int_to_str(resp_type) + "\n");
     if (resp_type == 0) {
+        print("[mysql] auth OK\n");
         return fd;
     } else if (resp_type == 254) {
+        print("[mysql] auth switch\n");
         // Auth switch request: parse plugin name and new scramble
         let switch_plugin_len: i32 = my_cstr_len(resp, 5);
         let switch_off: i32 = 5 + switch_plugin_len + 1;
@@ -408,6 +419,7 @@ fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
             }
         }
         if (is_native == 0) {
+            print("[mysql] auth switch: not native\n");
             net_close(fd);
             return -1;
         }
@@ -415,22 +427,29 @@ fn mysql_connect(a: i32, b: i32, c: i32, d: i32, port: i32,
         let new_scramble: str = make_buffer(20);
         my_buf_copy(new_scramble, 0, resp, switch_off, 20);
         // Compute auth with new scramble
+        print("[mysql] computing auth with new scramble\n");
         let new_auth: str = sha1_mysql_auth(new_scramble, password);
         // Send auth response (sequence = 3)
+        print("[mysql] sending auth response seq=3\n");
         mysql_write_packet(fd, 3, new_auth, 20);
         // Read result
+        print("[mysql] reading final auth result\n");
         let resp2: str = mysql_read_packet(fd);
         if (my_pkt_len(resp2) < 1) {
+            print("[mysql] final auth empty\n");
             net_close(fd);
             return -1;
         }
         if (my_pkt_byte(resp2, 0) == 0) {
+            print("[mysql] auth switch OK\n");
             return fd;
         }
+        print("[mysql] auth switch FAIL type=" + int_to_str(my_pkt_byte(resp2, 0)) + "\n");
         net_close(fd);
         return -1;
     } else {
         // Error packet
+        print("[mysql] auth error type=" + int_to_str(resp_type) + "\n");
         net_close(fd);
         return -1;
     }
