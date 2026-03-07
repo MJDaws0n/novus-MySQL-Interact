@@ -743,12 +743,12 @@ fn mysql_col_name(result: str, col: i32) -> str {
         rest = substr(rest, spos + 1);
         i = i + 1;
     }
-    // Scan byte-by-byte until sep(1) or row_sep(2) or end
+    // Scan byte-by-byte until sep(9/TAB) or row_sep(10/LF) or end
     let name: str = "";
     let j: i32 = 0;
     while (j < len(rest)) {
         let ch: i32 = byte_at(rest, j);
-        if (ch == 1 || ch == 2) { break; }
+        if (ch == 9 || ch == 10) { break; }
         name = name + _byte_to_char(ch);
         j = j + 1;
     }
@@ -783,12 +783,12 @@ fn mysql_get(result: str, row: i32, col: i32) -> str {
         ci = ci + 1;
     }
 
-    // Read value until next sep(1), row_sep(2), or end
+    // Read value until next sep(9/TAB), row_sep(10/LF), or end
     let val: str = "";
     let j: i32 = 0;
     while (j < len(rest)) {
         let ch: i32 = byte_at(rest, j);
-        if (ch == 1 || ch == 2) { break; }
+        if (ch == 9 || ch == 10) { break; }
         val = val + _byte_to_char(ch);
         j = j + 1;
     }
