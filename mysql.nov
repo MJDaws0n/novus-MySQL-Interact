@@ -27,18 +27,28 @@ fn my_to_i32(x: i64) -> i32 {
 }
 
 fn my_buf_copy(dst: str, dst_off: i32, src: str, src_off: i32, count: i32) -> void {
-    let da: u64 = ptr(dst);
+    if (count <= 0) { return; }
     let i: i32 = 0;
     while (i < count) {
-        // Separate byte_at from store8 to avoid register clobbering on ARM64
-        let b: i32 = byte_at(src, src_off + i);
-        store8(da + i32_to_u64(dst_off + i), b);
+        dst[dst_off + i] = byte_at(src, src_off + i);
         i = i + 1;
     }
 }
 
+// Extract a substring from buffer at offset, returning a new string (no pipe_copy)
+fn my_extract(src: str, off: i32, count: i32) -> str {
+    if (count <= 0) { return ""; }
+    let buf: str = make_buffer(count);
+    let i: i32 = 0;
+    while (i < count) {
+        buf[i] = byte_at(src, off + i);
+        i = i + 1;
+    }
+    return buf;
+}
+
 fn my_buf_set(dst: str, off: i32, val: i32) -> void {
-    store8(ptr(dst) + i32_to_u64(off), val);
+    dst[off] = val;
 }
 
 fn my_buf_get(src: str, off: i32) -> i32 {
@@ -84,27 +94,20 @@ fn my_write_u32(buf: str, off: i32, val: i64) -> void {
 // Write a null-terminated string to buffer, return bytes written (including null)
 fn my_write_cstr(buf: str, off: i32, s: str) -> i32 {
     let slen: i32 = len(s);
-    let addr: u64 = ptr(buf);
     let i: i32 = 0;
     while (i < slen) {
-        let b: i32 = byte_at(s, i);
-        store8(addr + i32_to_u64(off + i), b);
+        buf[off + i] = byte_at(s, i);
         i = i + 1;
     }
-    store8(addr + i32_to_u64(off + slen), 0);
+    buf[off + slen] = 0;
     return slen + 1;
 }
 
 // Read null-terminated string from buffer
 fn my_read_cstr(buf: str, off: i32) -> str {
-    let result: str = "";
-    let i: i32 = off;
-    while (my_buf_get(buf, i) != 0) {
-        let ch: i32 = my_buf_get(buf, i);
-        result = result + _byte_to_char(ch);
-        i = i + 1;
-    }
-    return result;
+    let clen: i32 = my_cstr_len(buf, off);
+    if (clen == 0) { return ""; }
+    return my_extract(buf, off, clen);
 }
 
 // Length of null-terminated string in buffer (bounded to prevent runaway scan)
@@ -153,23 +156,22 @@ fn my_lenenc_size(buf: str, off: i32) -> i32 {
 // ============================================================================
 
 // Read exactly `length` bytes from socket into a buffer
+// Uses store8 to copy byte-by-byte to avoid null-byte string truncation
 fn my_read_exact(fd: i32, length: i32) -> str {
     let result: str = make_buffer(length);
-    let dest: u64 = ptr(result);
-    let total: i32 = 0;
-    let tmp: str = make_buffer(4096);
-    while (total < length) {
-        let want: i32 = length - total;
-        if (want > 4096) { want = 4096; }
-        let got: i32 = net_read(fd, tmp, want);
-        if (got <= 0) { break; }
-        let i: i32 = 0;
-        while (i < got) {
-            let b: i32 = byte_at(tmp, i);
-            store8(dest + i32_to_u64(total + i), b);
-            i = i + 1;
-        }
-        total = total + got;
+    let addr: u64 = ptr(result);
+    let end: u64 = addr + i32_to_u64(length);
+    while (addr < end) {
+        let remaining: u64 = end - addr;
+        mov(rax, 0);
+        mov(rdi, fd);
+        mov(rsi, addr);
+        mov(rdx, remaining);
+        syscall();
+        let got: u64 = getreg(rax);
+        if (got > 2147483647) { break; }
+        if (got == 0) { break; }
+        addr = addr + got;
     }
     return result;
 }
@@ -183,28 +185,25 @@ fn mysql_read_packet(fd: i32) -> str {
                            my_buf_get(header, 1) * 256 +
                            my_buf_get(header, 2) * 65536;
     if (payload_len <= 0) { return ""; }
+    if (payload_len > 16777215) { return ""; }
     let result: str = make_buffer(4 + payload_len);
-    // Encode length with +1 per byte to avoid null terminators
-    my_buf_set(result, 0, (payload_len & 255) + 1);
-    my_buf_set(result, 1, ((payload_len / 256) & 255) + 1);
-    my_buf_set(result, 2, ((payload_len / 65536) & 255) + 1);
-    my_buf_set(result, 3, 1);
-    // Read payload into result at offset 4
-    let dest: u64 = ptr(result);
-    let total: i32 = 0;
-    let tmp: str = make_buffer(4096);
-    while (total < payload_len) {
-        let want: i32 = payload_len - total;
-        if (want > 4096) { want = 4096; }
-        let got: i32 = net_read(fd, tmp, want);
-        if (got <= 0) { break; }
-        let i: i32 = 0;
-        while (i < got) {
-            let b: i32 = byte_at(tmp, i);
-            store8(dest + i32_to_u64(4 + total + i), b);
-            i = i + 1;
-        }
-        total = total + got;
+    result[0] = (payload_len & 255) + 1;
+    result[1] = ((payload_len / 256) & 255) + 1;
+    result[2] = ((payload_len / 65536) & 255) + 1;
+    result[3] = 1;
+    let dest: u64 = ptr(result) + 4;
+    let end: u64 = dest + i32_to_u64(payload_len);
+    while (dest < end) {
+        let remaining: u64 = end - dest;
+        mov(rax, 0);
+        mov(rdi, fd);
+        mov(rsi, dest);
+        mov(rdx, remaining);
+        syscall();
+        let got: u64 = getreg(rax);
+        if (got > 2147483647) { break; }
+        if (got == 0) { break; }
+        dest = dest + got;
     }
     return result;
 }
@@ -567,11 +566,8 @@ fn mysql_query(fd: i32, sql: str) -> str {
         let name_len: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
         coff = coff + my_lenenc_size(col_pkt, coff);
         let col_name: str = "";
-        let ni: i32 = 0;
-        while (ni < name_len) {
-            let ch: i32 = my_buf_get(col_pkt, coff + ni);
-            col_name = col_name + _byte_to_char(ch);
-            ni = ni + 1;
+        if (name_len > 0) {
+            col_name = my_extract(col_pkt, coff, name_len);
         }
         result = result + my_sep() + col_name;
         ci = ci + 1;
@@ -610,11 +606,8 @@ fn mysql_query(fd: i32, sql: str) -> str {
                     let val_len: i32 = my_to_i32(my_read_lenenc_val(row_pkt, roff));
                     roff = roff + my_lenenc_size(row_pkt, roff);
                     let val: str = "";
-                    let vi: i32 = 0;
-                    while (vi < val_len) {
-                        let ch: i32 = my_buf_get(row_pkt, roff + vi);
-                        val = val + _byte_to_char(ch);
-                        vi = vi + 1;
+                    if (val_len > 0) {
+                        val = my_extract(row_pkt, roff, val_len);
                     }
                     result = result + val;
                     roff = roff + val_len;
@@ -785,30 +778,40 @@ fn mysql_is_null(result: str, row: i32, col: i32) -> bool {
 // Escape a string for safe inclusion in SQL queries.
 // Handles: ' " \ NUL \n \r \x1A (Ctrl-Z)
 fn mysql_escape(s: str) -> str {
-    let result: str = "";
     let slen: i32 = len(s);
+    if (slen == 0) { return ""; }
+    let sptr: u64 = ptr(s);
+    // Fast path: check if any special chars exist
+    let has_special: bool = false;
+    let ci: i32 = 0;
+    while (ci < slen) {
+        let ch: i32 = read_byte(sptr + i32_to_u64(ci));
+        if (ch == 0 || ch == 10 || ch == 13 || ch == 26 || ch == 39 || ch == 34 || ch == 92) {
+            has_special = true;
+            ci = slen;
+        } else { ci = ci + 1; }
+    }
+    if (!has_special) { return s; }
+
+    let result: str = "";
+    let start: i32 = 0;
     let i: i32 = 0;
     while (i < slen) {
-        let c: i32 = byte_at(s, i);
-        if (c == 0) {
-            result = result + "\\0";
-        } else if (c == 10) {
-            result = result + "\\n";
-        } else if (c == 13) {
-            result = result + "\\r";
-        } else if (c == 26) {
-            result = result + "\\Z";
-        } else if (c == 39) {
-            result = result + "\\'";
-        } else if (c == 34) {
-            result = result + "\\\"";
-        } else if (c == 92) {
-            result = result + "\\\\";
-        } else {
-            result = result + _byte_to_char(byte_at(s, i));
+        let c: i32 = read_byte(sptr + i32_to_u64(i));
+        if (c == 0 || c == 10 || c == 13 || c == 26 || c == 39 || c == 34 || c == 92) {
+            if (i > start) { result = result + substr_len(s, start, i - start); }
+            if (c == 0) { result = result + "\\0"; }
+            else if (c == 10) { result = result + "\\n"; }
+            else if (c == 13) { result = result + "\\r"; }
+            else if (c == 26) { result = result + "\\Z"; }
+            else if (c == 39) { result = result + "\\'"; }
+            else if (c == 34) { result = result + "\\\""; }
+            else if (c == 92) { result = result + "\\\\"; }
+            start = i + 1;
         }
         i = i + 1;
     }
+    if (start < slen) { result = result + substr_len(s, start, slen - start); }
     return result;
 }
 
@@ -819,17 +822,29 @@ fn mysql_quote(s: str) -> str {
 
 // Escape an identifier (table/column name) with backticks
 fn mysql_escape_id(s: str) -> str {
-    let result: str = "`";
     let slen: i32 = len(s);
+    if (slen == 0) { return "``"; }
+    // Check for backticks
+    let has_bt: bool = false;
+    let sptr: u64 = ptr(s);
+    let ci: i32 = 0;
+    while (ci < slen) {
+        if (read_byte(sptr + i32_to_u64(ci)) == 96) { has_bt = true; ci = slen; }
+        else { ci = ci + 1; }
+    }
+    if (!has_bt) { return "`" + s + "`"; }
+    let result: str = "`";
+    let start: i32 = 0;
     let i: i32 = 0;
     while (i < slen) {
-        if (byte_at(s, i) == 96) {
+        if (read_byte(sptr + i32_to_u64(i)) == 96) {
+            if (i > start) { result = result + substr_len(s, start, i - start); }
             result = result + "``";
-        } else {
-            result = result + _byte_to_char(byte_at(s, i));
+            start = i + 1;
         }
         i = i + 1;
     }
+    if (start < slen) { result = result + substr_len(s, start, slen - start); }
     return result + "`";
 }
 
@@ -1093,11 +1108,8 @@ fn mysql_stmt_execute(fd: i32, stmt_id: i32, params: str, num_params: i32) -> st
         let name_len: i32 = my_to_i32(my_read_lenenc_val(col_pkt, coff));
         coff = coff + my_lenenc_size(col_pkt, coff);
         let col_name: str = "";
-        let ni: i32 = 0;
-        while (ni < name_len) {
-            let ch: i32 = my_buf_get(col_pkt, coff + ni);
-            col_name = col_name + _byte_to_char(ch);
-            ni = ni + 1;
+        if (name_len > 0) {
+            col_name = my_extract(col_pkt, coff, name_len);
         }
         result = result + my_sep() + col_name;
         ci = ci + 1;
@@ -1143,11 +1155,8 @@ fn mysql_stmt_execute(fd: i32, stmt_id: i32, params: str, num_params: i32) -> st
                     let vlen: i32 = my_to_i32(my_read_lenenc_val(row_pkt, val_off));
                     val_off = val_off + my_lenenc_size(row_pkt, val_off);
                     let val: str = "";
-                    let vi: i32 = 0;
-                    while (vi < vlen) {
-                        let ch: i32 = my_buf_get(row_pkt, val_off + vi);
-                        val = val + _byte_to_char(ch);
-                        vi = vi + 1;
+                    if (vlen > 0) {
+                        val = my_extract(row_pkt, val_off, vlen);
                     }
                     result = result + val;
                     val_off = val_off + vlen;
